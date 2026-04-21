@@ -10,90 +10,12 @@ const github = new Octokit({
   auth: process.env.GITHUB_OCTOKIT_TOKEN,
 });
 
-// const searchRepo = async (query) => {
-//   const q = `${query} repo:${OWNER}/${REPO}`;
 
-//   const res = await github.search.code({
-//     q,
-//     per_page: 10,
-//   });
-
-//   console.log(res)
-
-//   return res.data?.url
-// }
-
-// async function readFile(path) {
-//   const res = await github.repos.getContent({
-//     owner: OWNER,
-//     repo: REPO,
-//     path,
-//   });
-
-//   if (!("content" in res.data)) {
-//     throw new Error("Not a file");
-//   }
-
-//   const content = Buffer.from(res.data.content, "base64").toString("utf8");
-
-//   return {
-//     path,
-//     content,
-//   };
-// }
-
-// async function runDebugger(issue) {
-//   console.log("Issue:", issue);
-
-//   // Example manual flow:
-//   const file = await searchRepo(issue);
-//   console.log("Relevant Files:", file);
-
-//   if (file) {
-//     const file = await readFile(file);
-//     console.log("File Content:", file.content.slice(0, 300));
-//   }
-//   console.log("Recent Commits:", recent);
-// }
-
-// export async function createPR(branch) {
-//   const pr = await octokit.pulls.create({
-//     owner: process.env.GITHUB_OWNER,
-//     repo: process.env.GITHUB_REPO,
-
-//     title: "AI Fix: Bug detected",
-
-//     head: branch,
-
-//     base: "main",
-
-//     body: "AI generated fix",
-//   });
-
-//   return pr.data.html_url;
-// }
-
-// export {
-//   runDebugger
-// }
-
-/**
- * Autonomous GitHub Debug Agent (Node.js + Ollama + GitHub)
- *
- * npm i @octokit/rest axios
- *
- * ENV:
- * GITHUB_TOKEN=xxxx
- *
- * Runs:
- * node agent.js
- */
 
 /* =====================================================
    OLLAMA CONFIG
 ===================================================== */
 
-const OLLAMA_URL = "http://localhost:11434/api/chat";
 const MODEL = "gpt-oss:20b";
 
 const TOOLS = [

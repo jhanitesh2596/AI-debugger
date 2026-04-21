@@ -22,7 +22,6 @@ slackApp.event("app_mention", async ({ event, client }) => {
   const issue = event.text;
 
   const code = await debugIssue(issue);
-  console.log("code", code)
 
   const result = await analyze(issue, code);
   await client.chat.postMessage({
