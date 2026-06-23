@@ -212,9 +212,7 @@ async function getDefaultTreeSha(target = defaultTargetRepo()) {
   return defaultTreeShaPromises.get(key);
 }
 
-/* =====================================================
-   GITHUB TOOLS
-===================================================== */
+// GITHUB TOOLS
 
 async function listFiles(path = "", target = defaultTargetRepo()) {
   const cleanPath = pathFromGitHubInput(path);
@@ -290,10 +288,8 @@ async function searchCodePathFallback(query, target = defaultTargetRepo()) {
     .map((path) => ({ path }));
 }
 
-/**
- * GitHub /search/code is best-effort only (indexing, qualifiers, org settings). This scans
- * file contents via the Contents API so symbols like handleKeyPress are actually found.
- */
+// Tool calling
+
 async function searchCodeByScanningFiles(query, target = defaultTargetRepo()) {
   const trimmed = query.trim();
   const lower = trimmed.toLowerCase();
@@ -347,9 +343,8 @@ async function searchCodeByScanningFiles(query, target = defaultTargetRepo()) {
   return hits;
 }
 
-/**
- * GitHub code search API + blob scan fallback + path-only fallback.
- */
+
+// GitHub code search API + blob scan fallback + path-only fallback.
 async function searchCode(query, target = defaultTargetRepo()) {
   const trimmed = query.trim();
   if (!trimmed || !target.owner || !target.repo) {
@@ -445,10 +440,7 @@ async function recentCommits(target = defaultTargetRepo()) {
   }));
 }
 
-/* =====================================================
-   TOOL EXECUTOR
-===================================================== */
-
+// TOOL EXECUTOR
 export async function runTool(action, args, target = defaultTargetRepo()) {
   switch (action) {
     case "listFiles":
