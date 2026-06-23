@@ -1,8 +1,7 @@
 import express from "express";
 import cors from "cors";
-import { analyze } from "./ai.js";
 import { App } from "@slack/bolt";
-import { debugIssue } from "./services/githubService.js";
+import { debugIssue } from "./services/aiService.js";
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -21,9 +20,7 @@ const slackApp = new App({
 slackApp.event("app_mention", async ({ event, client }) => {
   const issue = event.text;
 
-  const code = await debugIssue(issue);
-
-  const result = await analyze(issue, code);
+  const result = await debugIssue(issue);
   await client.chat.postMessage({
     channel: event.channel,
 
@@ -37,8 +34,7 @@ slackApp.start();
 console.log("Bot running");
 app.post("/analyze", async (req, res) => {
   const issue = req.body.issue;
-  const repoCode = await debugIssue(issue);
-  const result = await analyze(issue, repoCode);
+  const result = await debugIssue(issue);
   res.json({
     analysis: result,
   });

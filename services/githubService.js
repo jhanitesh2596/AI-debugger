@@ -1,89 +1,230 @@
 import { Octokit } from "@octokit/rest";
-import { Ollama } from "ollama";
 import dotenv from "dotenv";
 dotenv.config();
 
 const OWNER = process.env.GITHUB_OWNER;
 const REPO = process.env.GITHUB_REPO;
+const envValue = (name) => (process.env[name] || "").trim();
+const GITHUB_TOKEN =
+  envValue("GITHUB_TOKEN") || envValue("GITHUB_OCTOKIT_TOKEN") || "";
 
 const github = new Octokit({
-  auth: process.env.GITHUB_OCTOKIT_TOKEN,
+  auth: GITHUB_TOKEN || undefined,
 });
 
+const repoInfoPromises = new Map();
+const defaultTreeShaPromises = new Map();
 
-
-/* =====================================================
-   OLLAMA CONFIG
-===================================================== */
-
-const MODEL = "gpt-oss:20b";
-
-const TOOLS = [
-  {
-    type: "function",
-    function: {
-      name: "listFiles",
-      description: "List files/folders in repository path",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-        },
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "readFile",
-      description: "Read repository file content",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string" },
-        },
-        required: ["path"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "searchCode",
-      description:
-        "Search for text, symbols, or identifiers inside file contents (GitHub code search). Returns matching file paths—then use readFile on them.",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-        },
-        required: ["query"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "recentCommits",
-      description: "Get latest repository commits",
-      parameters: {
-        type: "object",
-        properties: {},
-      },
-    },
-  },
-];
-
-/* =====================================================
-   TOOLS
-===================================================== */
-
-async function listFiles(path = "") {
-  const res = await github.repos.getContent({
+function defaultTargetRepo() {
+  return {
     owner: OWNER,
     repo: REPO,
-    path,
-  });
+  };
+}
+
+function repoKey(target = defaultTargetRepo()) {
+  return `${target.owner || ""}/${target.repo || ""}`;
+}
+
+function normalizeSlackLink(value = "") {
+  const text = String(value).trim();
+  const match = text.match(/^<([^>|]+)(?:\|[^>]+)?>$/);
+  return match ? match[1] : text;
+}
+
+function parseGitHubUrl(value = "") {
+  const normalized = normalizeSlackLink(value);
+
+  try {
+    const url = new URL(normalized);
+    if (url.hostname !== "github.com") {
+      return null;
+    }
+
+    const parts = url.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) {
+      return null;
+    }
+
+    const refType = parts[2];
+    const ref = parts[3];
+    const path = ["blob", "tree"].includes(refType)
+      ? parts.slice(4).join("/")
+      : "";
+
+    return {
+      owner: parts[0],
+      repo: parts[1],
+      refType,
+      ref,
+      path,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function targetRepoFromIssue(issue) {
+  const urlMatches = String(issue).match(/https:\/\/github\.com\/[^\s>|)]+/g);
+
+  for (const url of urlMatches || []) {
+    const parsed = parseGitHubUrl(url);
+    if (parsed?.owner && parsed?.repo) {
+      return {
+        owner: parsed.owner,
+        repo: parsed.repo,
+      };
+    }
+  }
+
+  return defaultTargetRepo();
+}
+
+export function fileLinksFromIssue(issue) {
+  const urlMatches = String(issue).match(/https:\/\/github\.com\/[^\s>|)]+/g);
+  const seen = new Set();
+  const files = [];
+
+  for (const url of urlMatches || []) {
+    const parsed = parseGitHubUrl(url);
+    if (parsed?.refType !== "blob" || !parsed.path) {
+      continue;
+    }
+
+    const key = `${parsed.owner}/${parsed.repo}/${parsed.path}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    files.push({
+      owner: parsed.owner,
+      repo: parsed.repo,
+      path: parsed.path,
+    });
+  }
+
+  return files;
+}
+
+function pathFromGitHubInput(value) {
+  const parsed = parseGitHubUrl(value);
+  if (parsed?.path) {
+    return parsed.path;
+  }
+
+  return normalizeSlackLink(value).replace(/^\/+/, "");
+}
+
+function githubAccessError(operation, err, target = defaultTargetRepo()) {
+  const status = err.status || err.response?.status;
+
+  if (!target.owner || !target.repo) {
+    return new Error(
+      `GitHub ${operation} failed: set GITHUB_OWNER and GITHUB_REPO.`,
+    );
+  }
+
+  if (status === 401) {
+    return new Error(
+      `GitHub ${operation} failed: token is invalid or expired. Set GITHUB_OCTOKIT_TOKEN or GITHUB_TOKEN.`,
+    );
+  }
+
+  if (status === 403) {
+    return new Error(
+      `GitHub ${operation} failed: token lacks permission or hit a rate limit. For private repos, use a token with repository contents access.`,
+    );
+  }
+
+  if (status === 404) {
+    const tokenHint = GITHUB_TOKEN
+      ? "The repository was not found or the token does not have access."
+      : "The repository may be private. Set GITHUB_OCTOKIT_TOKEN or GITHUB_TOKEN with access to it.";
+
+    return new Error(`GitHub ${operation} failed: ${tokenHint}`);
+  }
+
+  return new Error(`GitHub ${operation} failed: ${err.message}`);
+}
+
+async function withGitHubAccess(operation, target, request) {
+  try {
+    return await request();
+  } catch (err) {
+    throw githubAccessError(operation, err, target);
+  }
+}
+
+async function getRepoInfo(target = defaultTargetRepo()) {
+  const key = repoKey(target);
+
+  if (!repoInfoPromises.has(key)) {
+    repoInfoPromises.set(
+      key,
+      withGitHubAccess("repository lookup", target, () =>
+        github.repos.get({
+          owner: target.owner,
+          repo: target.repo,
+        }),
+      ),
+    );
+  }
+
+  const res = await repoInfoPromises.get(key);
+  return res.data;
+}
+
+async function getDefaultTreeSha(target = defaultTargetRepo()) {
+  const key = repoKey(target);
+
+  if (!defaultTreeShaPromises.has(key)) {
+    defaultTreeShaPromises.set(
+      key,
+      (async () => {
+        const repo = await getRepoInfo(target);
+        const branch = repo.default_branch;
+
+        const ref = await withGitHubAccess("default branch lookup", target, () =>
+          github.git.getRef({
+            owner: target.owner,
+            repo: target.repo,
+            ref: `heads/${branch}`,
+          }),
+        );
+
+        const commit = await withGitHubAccess(
+          "default branch commit lookup",
+          target,
+          () =>
+            github.git.getCommit({
+              owner: target.owner,
+              repo: target.repo,
+              commit_sha: ref.data.object.sha,
+            }),
+        );
+
+        return commit.data.tree.sha;
+      })(),
+    );
+  }
+
+  return defaultTreeShaPromises.get(key);
+}
+
+/* =====================================================
+   GITHUB TOOLS
+===================================================== */
+
+async function listFiles(path = "", target = defaultTargetRepo()) {
+  const cleanPath = pathFromGitHubInput(path);
+  const res = await withGitHubAccess("list files", target, () =>
+    github.repos.getContent({
+      owner: target.owner,
+      repo: target.repo,
+      path: cleanPath,
+    }),
+  );
 
   if (!Array.isArray(res.data)) return [];
 
@@ -114,13 +255,16 @@ function isScannableSourcePath(p) {
   return !SKIP_PATH_SUBSTR.some((s) => lower.includes(s));
 }
 
-async function getTreeBlobPaths() {
-  const tree = await github.git.getTree({
-    owner: OWNER,
-    repo: REPO,
-    tree_sha: "HEAD",
-    recursive: "true",
-  });
+async function getTreeBlobPaths(target = defaultTargetRepo()) {
+  const treeSha = await getDefaultTreeSha(target);
+  const tree = await withGitHubAccess("repository tree lookup", target, () =>
+    github.git.getTree({
+      owner: target.owner,
+      repo: target.repo,
+      tree_sha: treeSha,
+      recursive: "true",
+    }),
+  );
 
   return tree.data.tree
     .filter((x) => x.type === "blob")
@@ -128,13 +272,13 @@ async function getTreeBlobPaths() {
     .filter(isScannableSourcePath);
 }
 
-async function searchCodePathFallback(query) {
+async function searchCodePathFallback(query, target = defaultTargetRepo()) {
   const terms = query
     .toLowerCase()
     .split(/\s+/)
     .filter(Boolean);
 
-  const files = await getTreeBlobPaths();
+  const files = await getTreeBlobPaths(target);
 
   if (!terms.length) {
     return files.slice(0, 10).map((path) => ({ path }));
@@ -150,14 +294,14 @@ async function searchCodePathFallback(query) {
  * GitHub /search/code is best-effort only (indexing, qualifiers, org settings). This scans
  * file contents via the Contents API so symbols like handleKeyPress are actually found.
  */
-async function searchCodeByScanningFiles(query) {
+async function searchCodeByScanningFiles(query, target = defaultTargetRepo()) {
   const trimmed = query.trim();
   const lower = trimmed.toLowerCase();
-  if (!trimmed || !OWNER || !REPO) {
+  if (!trimmed || !target.owner || !target.repo) {
     return [];
   }
 
-  const paths = await getTreeBlobPaths();
+  const paths = await getTreeBlobPaths(target);
   const maxFilesToScan = 400;
   const maxHits = 30;
   const batchSize = 6;
@@ -172,7 +316,7 @@ async function searchCodeByScanningFiles(query) {
     const results = await Promise.all(
       batch.map(async (path) => {
         try {
-          const text = await readFile(path);
+          const text = await readFile(path, target);
           if (text === "Not a file" || typeof text !== "string") {
             return null;
           }
@@ -206,13 +350,18 @@ async function searchCodeByScanningFiles(query) {
 /**
  * GitHub code search API + blob scan fallback + path-only fallback.
  */
-async function searchCode(query) {
+async function searchCode(query, target = defaultTargetRepo()) {
   const trimmed = query.trim();
-  if (!trimmed || !OWNER || !REPO) {
+  if (!trimmed || !target.owner || !target.repo) {
     return [];
   }
 
-  const repoScope = `repo:${OWNER}/${REPO}`;
+  const parsed = parseGitHubUrl(trimmed);
+  if (parsed?.path) {
+    return [{ path: parsed.path }];
+  }
+
+  const repoScope = `repo:${target.owner}/${target.repo}`;
   // Simplest queries first — overly strict qualifiers often return 0 hits.
   const queries = [
     `${trimmed} ${repoScope}`,
@@ -258,32 +407,37 @@ async function searchCode(query) {
     `searchCode: GitHub /search/code returned 0 for "${trimmed}" — scanning repository files`,
   );
 
-  const scanned = await searchCodeByScanningFiles(trimmed);
+  const scanned = await searchCodeByScanningFiles(trimmed, target);
   if (scanned.length) {
     return scanned;
   }
 
-  return searchCodePathFallback(trimmed);
+  return searchCodePathFallback(trimmed, target);
 }
 
-async function readFile(path) {
-  const res = await github.repos.getContent({
-    owner: OWNER,
-    repo: REPO,
-    path,
-  });
+export async function readFile(path, target = defaultTargetRepo()) {
+  const cleanPath = pathFromGitHubInput(path);
+  const res = await withGitHubAccess("read file", target, () =>
+    github.repos.getContent({
+      owner: target.owner,
+      repo: target.repo,
+      path: cleanPath,
+    }),
+  );
 
   if (!("content" in res.data)) return "Not a file";
 
   return Buffer.from(res.data.content, "base64").toString("utf8");
 }
 
-async function recentCommits() {
-  const res = await github.repos.listCommits({
-    owner: OWNER,
-    repo: REPO,
-    per_page: 5,
-  });
+async function recentCommits(target = defaultTargetRepo()) {
+  const res = await withGitHubAccess("recent commits lookup", target, () =>
+    github.repos.listCommits({
+      owner: target.owner,
+      repo: target.repo,
+      per_page: 5,
+    }),
+  );
 
   return res.data.map((c) => ({
     sha: c.sha,
@@ -292,320 +446,30 @@ async function recentCommits() {
 }
 
 /* =====================================================
-   OLLAMA CALL
-===================================================== */
-
-const ollama = new Ollama({
-  host: process.env.OLLAMA_HOST,
-  headers: {
-    Authorization: `Bearer ${process.env.OLLAMA_AUTH_TOKEN}`,
-  },
-});
-
-async function askLLM(messages, enableTools = true) {
-  try {
-    const payload = {
-      model: MODEL,
-      messages,
-      stream: false,
-      options: {
-        temperature: 0.2,
-      },
-    };
-
-    if (enableTools) {
-      payload.tools = TOOLS;
-    } else {
-      // Prefer user-visible `content` on the final turn (reasoning models otherwise leave it empty).
-      payload.think = false;
-    }
-
-    const res = await ollama.chat(payload);
-
-    const msg = res.message || {};
-    // Reasoning models (e.g. gpt-oss) often return empty `content` and put text in `thinking`.
-    const text =
-      (msg.content && String(msg.content).trim()) ||
-      (msg.thinking && String(msg.thinking).trim()) ||
-      "";
-
-    return {
-      role: msg.role || "assistant",
-      content: text,
-      tool_calls: msg.tool_calls || [],
-    };
-  } catch (error) {
-    console.error("askLLM error:", error.message);
-
-    return {
-      role: "assistant",
-      content: "Model request failed.",
-      tool_calls: [],
-    };
-  }
-}
-
-/* =====================================================
    TOOL EXECUTOR
 ===================================================== */
 
-async function runTool(action, args) {
+export async function runTool(action, args, target = defaultTargetRepo()) {
   switch (action) {
     case "listFiles":
-      return await listFiles(args.path || "");
+      return await listFiles(args.path || "", target);
 
     case "searchCode":
-      return await searchCode(args.query);
+      return await searchCode(args.query, target);
 
     case "readFile": {
       const p = args.path;
-      const text = await readFile(p);
+      const text = await readFile(p, target);
       if (text === "Not a file") {
         return { path: p, error: "Not a file or directory" };
       }
-      return { path: p, content: text };
+      return { path: pathFromGitHubInput(p), content: text };
     }
 
     case "recentCommits":
-      return await recentCommits();
+      return await recentCommits(target);
 
     default:
       return "Unknown tool";
   }
 }
-
-function looksLikeStructuredDiagnosis(text) {
-  return /root\s*cause\s*:/i.test(text) && /evidence\s*:/i.test(text);
-}
-
-/**
- * Summarize tool outputs so the final LLM cannot claim "no evidence" when tools already returned paths/code.
- */
-function buildGroundTruthFromHistory(history) {
-  const searchHits = new Set();
-  const readFiles = [];
-  const errors = [];
-
-  for (const m of history) {
-    if (m.role !== "tool") {
-      continue;
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(m.content);
-    } catch {
-      continue;
-    }
-
-    if (parsed?.path && typeof parsed.content === "string") {
-      const snippet = parsed.content.replace(/\s+/g, " ").slice(0, 280);
-      readFiles.push(
-        `${parsed.path} (read ${parsed.content.length} chars): …${snippet}…`,
-      );
-      continue;
-    }
-
-    if (parsed?.path && parsed?.error) {
-      errors.push(`${parsed.path}: ${parsed.error}`);
-      continue;
-    }
-
-    if (Array.isArray(parsed) && parsed[0]) {
-      const first = parsed[0];
-      // searchCode: [{ path: "..." }] only — listFiles always includes name + type
-      if (first.path && !first.name && !first.sha) {
-        for (const item of parsed) {
-          if (item.path) {
-            searchHits.add(item.path);
-          }
-        }
-        continue;
-      }
-    }
-  }
-
-  const lines = [];
-  if (searchHits.size) {
-    lines.push(
-      `Files matched by searchCode (GitHub indexed content): ${[...searchHits].join(", ")}`,
-    );
-  }
-  if (readFiles.length) {
-    lines.push("Files read via readFile:");
-    lines.push(...readFiles);
-  }
-  if (errors.length) {
-    lines.push(`Tool errors: ${errors.join("; ")}`);
-  }
-
-  if (!lines.length) {
-    return "No search hits or file reads were recorded in this session.";
-  }
-
-  return lines.join("\n");
-}
-
-/* =====================================================
-   DEBUG LOOP
-===================================================== */
-
-async function debugIssue(issue) {
-  const MAX_STEPS = 8;
-  const seenCalls = new Set();
-
-  const history = [
-    {
-      role: "system",
-      content: `
-You are a senior software debugging agent.
-
-Goal:
-Find likely cause of bugs in GitHub repositories quickly.
-
-Available tools:
-- searchCode(query)
-- readFile(path)
-- listFiles(path)
-- recentCommits()
-
-Rules:
-1. Prefer searchCode first to find symbols or strings in source files.
-2. After searchCode returns paths, call readFile on the most relevant file(s)—you must read source before diagnosing.
-3. Do not repeat same tool calls.
-4. Max 8 tool rounds.
-5. If uncertain, still provide best likely diagnosis.
-6. Do not reply with plans or narration alone—call tools until you have read relevant files.
-7. Your Evidence must match tool results. Never claim "no evidence" or "symbol not found" if searchCode or readFile already returned that symbol or file.
-8. Final answer format (only after you have used tools or the repo is empty):
-
-Root Cause:
-Evidence:
-Fix:
-Confidence:
-`,
-    },
-    {
-      role: "user",
-      content: issue,
-    },
-  ];
-
-  for (let step = 0; step < MAX_STEPS; step++) {
-    console.log(`\nSTEP ${step + 1}`);
-
-    const res = await askLLM(history, true);
-
-    console.log("MODEL:", res);
-
-    /**
-     * Final answer directly — only after tools ran or the model already used the required format.
-     * Otherwise gpt-oss often returns a "plan" in natural language and never calls tools.
-     */
-    if (!res.tool_calls?.length && res.content?.trim()) {
-      const hasToolEvidence = history.some((m) => m.role === "tool");
-      if (hasToolEvidence || looksLikeStructuredDiagnosis(res.content)) {
-        return res.content;
-      }
-      history.push({
-        role: "assistant",
-        content: res.content,
-      });
-      history.push({
-        role: "user",
-        content: `You must call the repository tools now (searchCode, readFile, listFiles, or recentCommits) with real arguments. Do not describe what you will do—invoke a tool immediately.`,
-      });
-      continue;
-    }
-
-    /**
-     * Tool calling mode
-     */
-    if (res.tool_calls?.length) {
-      history.push({
-        role: "assistant",
-        content: res.content || "",
-        tool_calls: res.tool_calls,
-      });
-
-      let repeated = true;
-
-      for (const call of res.tool_calls) {
-        const toolName = call.function.name;
-
-        const args =
-          typeof call.function.arguments === "string"
-            ? JSON.parse(call.function.arguments)
-            : call.function.arguments || {};
-
-        const signature = `${toolName}:${JSON.stringify(args)}`;
-
-        if (!seenCalls.has(signature)) {
-          repeated = false;
-        }
-
-        seenCalls.add(signature);
-
-        console.log("TOOL:", toolName, args);
-
-        let result;
-
-        try {
-          result = await runTool(toolName, args);
-        } catch (err) {
-          result = { error: err.message };
-        }
-
-        history.push({
-          role: "tool",
-          content: JSON.stringify(result).slice(0, 12000),
-        });
-      }
-
-      /**
-       * If repeating same calls, stop exploring
-       */
-      if (repeated) {
-        break;
-      }
-
-      continue;
-    }
-
-    break;
-  }
-
-  /**
-   * Forced Final Answer (TOOLS DISABLED)
-   */
-  const groundTruth = buildGroundTruthFromHistory(history);
-
-  const final = await askLLM(
-    [
-      ...history,
-      {
-        role: "user",
-        content: `
-GROUND TRUTH FROM TOOLS (must appear in Evidence; do not contradict):
-${groundTruth}
-
-No more tool calls allowed.
-
-Based on the issue and the evidence above, give your BEST final diagnosis.
-
-Use format:
-
-Root Cause:
-Evidence:
-Fix:
-Confidence:
-`,
-      },
-    ],
-    false,
-  );
-
-  return final.content || "Unable to determine confidently.";
-}
-
-export { debugIssue };
